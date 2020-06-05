@@ -1,11 +1,22 @@
 # -*- coding: binary -*-
 
 require 'rex/ui/text/output/buffer/stdout'
+require 'msf/ui/console/table_print/rank_styler'
+require 'msf/ui/console/table_print/rank_formatter'
+require 'msf/ui/console/table_print/highlight_substring_styler'
+
 
 module Msf
   module Ui
     module Console
       module CommandDispatcher
+
+        #
+        # Module Type Shorthands
+        #
+        MODULE_TYPE_SHORTHANDS = {
+          "aux" => Msf::MODULE_AUX
+        }
 
         #
         # {CommandDispatcher} for commands related to background jobs in Metasploit Framework.
@@ -15,14 +26,14 @@ module Msf
           include Msf::Ui::Console::CommandDispatcher
           include Msf::Ui::Console::CommandDispatcher::Common
 
-          # Constant for a retry timeout on using modules before they're loaded
-          CMD_USE_TIMEOUT = 3
+          include Rex::Text::Color
 
           @@search_opts = Rex::Parser::Arguments.new(
-            "-h"     => [ false, "Help banner"],
-            "-o"     => [ true, "Send output to a file in csv format"],
-            "-S"     => [ true, "Search string for row filter"],
-            "-u"     => [ false, "Use module if there is one result"]
+            '-h' => [false, 'Help banner'],
+            '-I' => [false, 'Ignore the command if the only match has the same name as the search'],
+            '-o' => [true,  'Send output to a file in csv format'],
+            '-S' => [true,  'Regex pattern used to filter search results'],
+            '-u' => [false, 'Use module if there is one result']
           )
 
           def commands
@@ -34,11 +45,13 @@ module Msf
               "loadpath"   => "Searches for and loads modules from a path",
               "popm"       => "Pops the latest module off the stack and makes it active",
               "pushm"      => "Pushes the active or list of modules onto the module stack",
+              "listm"      => "List the module stack",
+              "clearm"     => "Clear the module stack",
               "previous"   => "Sets the previously loaded module as the current module",
               "reload_all" => "Reloads all modules from all defined module paths",
               "search"     => "Searches module names and descriptions",
               "show"       => "Displays modules of a given type, or all modules",
-              "use"        => "Selects a module by name",
+              "use"        => "Interact with a module by name or search term/index",
             }
           end
 
@@ -51,6 +64,8 @@ module Msf
             @dscache = {}
             @previous_module = nil
             @module_name_stack = []
+            @module_search_results = []
+            @@payload_show_results = []
             @dangerzone_map = nil
           end
 
@@ -269,7 +284,7 @@ module Msf
             added = "Loaded #{overall} modules:\n"
 
             totals.each_pair { |type, count|
-              added << "    #{count} #{type}#{count != 1 ? 's' : ''}\n"
+              added << "    #{count} #{type} modules\n"
             }
 
             print(added)
@@ -318,12 +333,15 @@ module Msf
           end
 
           def cmd_search_help
-            print_line "Usage: search [ options ] <keywords>"
+            print_line "Usage: search [<options>] [<keywords>:<value>]"
+            print_line
+            print_line "Prepending a value with '-' will exclude any matching results."
+            print_line "If no options or keywords are provided, cached results are displayed."
             print_line
             print_line "OPTIONS:"
             print_line "  -h                Show this help information"
             print_line "  -o <file>         Send output to a file in csv format"
-            print_line "  -S <string>       Search string for row filter"
+            print_line "  -S <string>       Regex pattern used to filter search results"
             print_line "  -u                Use module if there is one result"
             print_line
             print_line "Keywords:"
@@ -337,7 +355,7 @@ module Msf
               'check'       => 'Modules that support the \'check\' method',
               'date'        => 'Modules with a matching disclosure date',
               'description' => 'Modules with a matching description',
-              'full_name'   => 'Modules with a matching full name',
+              'fullname'    => 'Modules with a matching full name',
               'mod_time'    => 'Modules with a matching modification date',
               'name'        => 'Modules with a matching descriptive name',
               'path'        => 'Modules with a matching path',
@@ -354,6 +372,7 @@ module Msf
             print_line
             print_line "Examples:"
             print_line "  search cve:2009 type:exploit"
+            print_line "  search cve:2009 type:exploit platform:-linux"
             print_line
           end
 
@@ -361,61 +380,89 @@ module Msf
           # Searches modules for specific keywords
           #
           def cmd_search(*args)
-            if args.empty?
-              print_error("Argument required\n")
-              cmd_search_help
-              return
-            end
+            match        = ''
+            row_filter  = nil
+            output_file  = nil
+            cached       = false
+            use          = false
+            count        = -1
+            search_terms = []
 
-            match = ''
-            use = false
-            search_term = nil
-            output_file = nil
-            @@search_opts.parse(args) { |opt, idx, val|
+            ignore_use_exact_match = false
+
+            @@search_opts.parse(args) do |opt, idx, val|
               case opt
-                when "-S"
-                  search_term = val
-                when "-h"
-                  cmd_search_help
-                  return
-                when '-o'
-                  output_file = val
-                when "-u"
-                  use = true
-                else
-                  match += val + " "
+              when '-S'
+                row_filter = val
+              when '-h'
+                cmd_search_help
+                return false
+              when '-o'
+                output_file = val
+              when '-u'
+                use = true
+              when '-I'
+                ignore_use_exact_match = true
+              else
+                match += val + ' '
               end
-            }
-
-            if match.empty? && search_term.nil?
-              print_error("Keywords or search argument required\n")
-              cmd_search_help
-              return
             end
 
-            # Display the table of matches
-            tbl = generate_module_table("Matching Modules", search_term)
-            search_params = parse_search_string(match)
-            count = 0
+            if args.empty?
+              if @module_search_results.empty?
+                cmd_search_help
+                return false
+              end
+
+              cached = true
+            end
+
             begin
-              modules = Msf::Modules::Metadata::Cache.instance.find(search_params)
-              modules.each do |m|
+              if cached
+                print_status('Displaying cached results')
+              else
+                search_params = parse_search_string(match)
+                @module_search_results = Msf::Modules::Metadata::Cache.instance.find(search_params)
+              end
+
+              if @module_search_results.empty?
+                print_error('No results from search')
+                return false
+              end
+
+              if ignore_use_exact_match && @module_search_results.length == 1 &&
+                  @module_search_results.first.fullname == match.strip
+                return false
+              end
+
+              if !search_params.nil? && !search_params['text'].nil?
+                search_params['text'][0].each do |t|
+                  search_terms << t
+                end
+              end
+
+              # Generate the table used to display matches
+              tbl = generate_module_table('Matching Modules', search_terms, row_filter)
+
+              @module_search_results.each do |m|
                 tbl << [
                     count += 1,
-                    m.full_name,
+                    m.fullname,
                     m.disclosure_date.nil? ? '' : m.disclosure_date.strftime("%Y-%m-%d"),
-                    RankingName[m.rank].to_s,
+                    m.rank,
                     m.check ? 'Yes' : 'No',
-                    m.name
+                    m.name,
                 ]
               end
-              if modules.length == 1 && use
-                used_module = modules.first.full_name
-                cmd_use(used_module)
+
+              if @module_search_results.length == 1 && use
+                used_module = @module_search_results.first.fullname
+                cmd_use(used_module, true)
               end
             rescue ArgumentError
               print_error("Invalid argument(s)\n")
               cmd_search_help
+              return false
             end
 
             if output_file
@@ -427,7 +474,10 @@ module Msf
               print_line(tbl.to_s)
               print_status("Using #{used_module}") if used_module
             end
+
+            true
           end
+
 
           #
           # Parses command line search string into a hash
@@ -453,6 +503,11 @@ module Msf
               next if search_term.length == 0
               keyword.downcase!
               search_term.downcase!
+
+              if keyword == "type"
+                search_term = MODULE_TYPE_SHORTHANDS[search_term] if MODULE_TYPE_SHORTHANDS.key?(search_term)
+              end
+
               res[keyword] ||=[   [],    []   ]
               if search_term[0,1] == "-"
                 next if search_term.length == 1
@@ -602,9 +657,20 @@ module Msf
           end
 
           def cmd_use_help
-            print_line "Usage: use module_name"
+            print_line 'Usage: use <name|term|index>'
             print_line
-            print_line "The use command is used to interact with a module of a given name."
+            print_line 'Interact with a module by name or search term/index.'
+            print_line 'If a module name is not found, it will be treated as a search term.'
+            print_line 'An index from the previous search results can be selected if desired.'
+            print_line
+            print_line 'Examples:'
+            print_line '  use exploit/windows/smb/ms17_010_eternalblue'
+            print_line
+            print_line '  use eternalblue'
+            print_line '  use <name|index>'
+            print_line
+            print_line '  search eternalblue'
+            print_line '  use <name|index>'
             print_line
           end
 
@@ -623,21 +689,32 @@ module Msf
             # Try to create an instance of the supplied module name
             mod_name = args[0]
 
+            # Use a module by search index
+            index_from_list(@module_search_results, mod_name) do |mod|
+              return false unless mod && mod.respond_to?(:fullname)
+
+              # Module cache object from @module_search_results
+              mod_name = mod.fullname
+            end
+
+            # See if the supplied module name has already been resolved
+            mod_resolved = args[1] == true ? true : false
+
             # Ensure we have a reference name and not a path
-            if mod_name.start_with?('./', 'modules/')
-              mod_name.sub!(%r{^(?:\./)?modules/}, '')
-            end
-            if mod_name.end_with?('.rb')
-              mod_name.sub!(/\.rb$/, '')
-            end
+            mod_name = trim_path(mod_name, "modules")
 
             begin
               mod = framework.modules.create(mod_name)
+
               unless mod
-                # Try one more time; see #4549
-                sleep CMD_USE_TIMEOUT
-                mod = framework.modules.create(mod_name)
-                unless mod
+                unless mod_resolved
+                  # Avoid trying to use the search result if it exactly matches
+                  # the module we were trying to load. The module cannot be
+                  # loaded and searching isn't going to change that.
+                  mods_found = cmd_search('-I', '-u', mod_name)
+                end
+
+                unless mods_found
                   print_error("Failed to load module: #{mod_name}")
                   return false
                 end
@@ -713,6 +790,8 @@ module Msf
             print_line
             print_line "Set the previously loaded module as the current module"
             print_line
+            print_line "Previous module: #{@previous_module ? @previous_module.fullname : 'none'}"
+            print_line
           end
 
           #
@@ -770,7 +849,7 @@ module Msf
                 @module_name_stack = []
                 print_status("The module stack is empty")
               else
-                @module_name_stack.pop[args[0]]
+                @module_name_stack.pop(args[0].to_i)
               end
             else #then just pop the array and make that the active module
               pop = @module_name_stack.pop
@@ -791,6 +870,38 @@ module Msf
             print_line "pop the latest module off of the module stack and make it the active module"
             print_line "or pop n modules off the stack, but don't change the active module"
             print_line
+          end
+
+          def cmd_listm_help
+            print_line 'Usage: listm'
+            print_line
+            print_line 'List the module stack'
+            print_line
+          end
+
+          def cmd_listm(*_args)
+            if @module_name_stack.empty?
+              print_error('The module stack is empty')
+              return
+            end
+
+            print_status("Module stack:\n")
+
+            @module_name_stack.to_enum.with_index.reverse_each do |name, idx|
+              print_line("[#{idx}]\t#{name}")
+            end
+          end
+
+          def cmd_clearm_help
+            print_line 'Usage: clearm'
+            print_line
+            print_line 'Clear the module stack'
+            print_line
+          end
+
+          def cmd_clearm(*_args)
+            print_status('Clearing the module stack')
+            @module_name_stack.clear
           end
 
           #
@@ -1002,10 +1113,12 @@ module Msf
           def show_payloads(regex = nil, minrank = nil, opts = nil) # :nodoc:
             # If an active module has been selected and it's an exploit, get the
             # list of compatible payloads and display them
-            if (active_module and (active_module.exploit? == true or active_module.evasion?))
-              show_module_set("Compatible Payloads", active_module.compatible_payloads, regex, minrank, opts)
+            if active_module && (active_module.exploit? || active_module.evasion?)
+              @@payload_show_results = active_module.compatible_payloads
+
+              show_module_set('Compatible Payloads', @@payload_show_results, regex, minrank, opts)
             else
-              show_module_set("Payloads", framework.payloads, regex, minrank, opts)
+              show_module_set('Payloads', framework.payloads, regex, minrank, opts)
             end
           end
 
@@ -1062,6 +1175,7 @@ module Msf
               [ 'Prompt', framework.datastore['Prompt'] || Msf::Ui::Console::Driver::DefaultPrompt.to_s.gsub(/%.../,"") , "The prompt string" ],
               [ 'PromptChar', framework.datastore['PromptChar'] || Msf::Ui::Console::Driver::DefaultPromptChar.to_s.gsub(/%.../,""), "The prompt character" ],
               [ 'PromptTimeFormat', framework.datastore['PromptTimeFormat'] || Time::DATE_FORMATS[:db].to_s, 'Format for timestamp escapes in prompts' ],
+              [ 'MeterpreterPrompt', framework.datastore['MeterpreterPrompt'] || '%undmeterpreter%clr', 'The meterpreter prompt string' ],
             ].each { |r| tbl << r }
 
             print(tbl.to_s)
@@ -1149,8 +1263,10 @@ module Msf
           end
 
           def show_module_set(type, module_set, regex = nil, minrank = nil, opts = nil) # :nodoc:
+            count = -1
+
             tbl = generate_module_table(type)
-            count = 0
+
             module_set.sort.each { |refname, mod|
               o = nil
 
@@ -1186,7 +1302,7 @@ module Msf
                       refname,
                       o.disclosure_date.nil? ? "" : o.disclosure_date.strftime("%Y-%m-%d"),
                       o.rank_to_s,
-                      o.respond_to?(:check) ? 'Yes' : 'No',
+                      o.has_check? ? 'Yes' : 'No',
                       o.name
                     ]
                   end
@@ -1197,17 +1313,35 @@ module Msf
             print(tbl.to_s)
           end
 
-          def generate_module_table(type, search_term = nil) # :nodoc:
-            Table.new(
-              Table::Style::Default,
-              'Header'     => type,
-              'Prefix'     => "\n",
-              'Postfix'    => "\n",
-              'Columns'    => [ '#', 'Name', 'Disclosure Date', 'Rank', 'Check', 'Description' ],
-              'SearchTerm' => search_term
-            )
+          def generate_module_table(type, search_terms = [], row_filter = nil) # :nodoc:
+              Table.new(
+                Table::Style::Default,
+                'Header'     => type,
+                'Prefix'     => "\n",
+                'Postfix'    => "\n",
+                'SearchTerm' => row_filter,
+                'Columns' => [
+                  '#',
+                  'Name',
+                  'Disclosure Date',
+                  'Rank',
+                  'Check',
+                  'Description'
+                ],
+                'ColProps' => {
+                  'Rank' => {
+                    'Formatters' => [Msf::Ui::Console::TablePrint::RankFormatter.new],
+                    'Stylers' => [Msf::Ui::Console::TablePrint::RankStyler.new]
+                  },
+                  'Name' => {
+                    'Stylers' => [Msf::Ui::Console::TablePrint::HighlightSubstringStyler.new(search_terms)]
+                  },
+                  'Description' => {
+                    'Stylers' => [Msf::Ui::Console::TablePrint::HighlightSubstringStyler.new(search_terms)]
+                  }
+                }
+              )
           end
-
         end
       end
     end

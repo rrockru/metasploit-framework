@@ -52,7 +52,7 @@ class Db
       "db_import"     => "Import a scan result file (filetype will be auto-detected)",
       "db_export"     => "Export a file containing the contents of the database",
       "db_nmap"       => "Executes nmap and records the output automatically",
-      "db_rebuild_cache" => "Rebuilds the database-stored module cache",
+      "db_rebuild_cache" => "Rebuilds the database-stored module cache (deprecated)",
       "analyze"       => "Analyze database information about a specific address or address range",
     }
 
@@ -179,10 +179,6 @@ class Db
           name: names.last
       }
       begin
-        if names.last == Msf::DBManager::Workspace::DEFAULT_WORKSPACE_NAME
-          print_error("Unable to rename a workspace to '#{Msf::DBManager::Workspace::DEFAULT_WORKSPACE_NAME}'")
-          return
-        end
         updated_ws = framework.db.update_workspace(opts)
         if updated_ws
           framework.db.workspace = updated_ws if names.first == framework.db.workspace.name
@@ -197,7 +193,6 @@ class Db
         end
       rescue => e
         print_error "Failed to rename workspace: #{e.message}"
-        e.backtrace.each { |line| print_error "#{line}"}
       end
 
     elsif names
@@ -296,7 +291,7 @@ class Db
     end
 
     each_host_range_chunk(host_ranges) do |host_search|
-      break if !host_search.nil? && host_search.empty?
+      next if host_search && host_search.empty?
 
       framework.db.hosts(address: host_search).each do |host|
         framework.db.update_host(host_data.merge(id: host.id))
@@ -317,27 +312,20 @@ class Db
 
     rws.each do |rw|
       rw.each do |ip|
-        opts[:ip] = ip
-        framework.db.add_host_tag(opts)
+        opts[:address] = ip
+        unless framework.db.add_host_tag(opts)
+          print_error("Host #{ip} could not be found.")
+        end
       end
     end
   end
 
-  def find_hosts_with_tag(workspace_id, host_address, tag_name)
+  def find_host_tags(workspace, host_id)
     opts = Hash.new()
-    opts[:workspace_id] = workspace_id
-    opts[:host_address] = host_address
-    opts[:tag_name] = tag_name
+    opts[:workspace] = workspace
+    opts[:id] = host_id
 
-    framework.db.find_hosts_with_tag(opts)
-  end
-
-  def find_host_tags(workspace_id, host_address)
-    opts = Hash.new()
-    opts[:workspace_id] = workspace_id
-    opts[:host_address] = host_address
-
-    framework.db.find_host_tags(opts)
+    framework.db.get_host_tags(opts)
   end
 
   def delete_host_tag(rws, tag_name)
@@ -346,12 +334,16 @@ class Db
     opts[:tag_name] = tag_name
 
     if rws == [nil]
-      framework.db.delete_host_tag(opts)
+      unless framework.db.delete_host_tag(opts)
+        print_error("Host #{opts[:address].to_s + " " if opts[:address]}could not be found.")
+      end
     else
       rws.each do |rw|
         rw.each do |ip|
-          opts[:ip] = ip
-          framework.db.delete_host_tag(opts)
+          opts[:address] = ip
+          unless framework.db.delete_host_tag(opts)
+            print_error("Host #{ip} could not be found.")
+          end
         end
       end
     end
@@ -547,7 +539,7 @@ class Db
 
     matched_host_ids = []
     each_host_range_chunk(host_ranges) do |host_search|
-      break if !host_search.nil? && host_search.empty?
+      next if host_search && host_search.empty?
 
       framework.db.hosts(address: host_search, non_dead: onlyup, search_term: search_term).each do |host|
         matched_host_ids << host.id
@@ -559,7 +551,7 @@ class Db
             when "vulns";     host.vuln_count
             when "workspace"; host.workspace.name
             when "tags"
-              found_tags = find_host_tags(framework.db.workspace.id, host.address)
+              found_tags = find_host_tags(framework.db.workspace, host.id)
               tag_names = []
               found_tags.each { |t| tag_names << t.name }
               found_tags * ", "
@@ -763,7 +755,7 @@ class Db
     matched_service_ids = []
 
     each_host_range_chunk(host_ranges) do |host_search|
-      break if !host_search.nil? && host_search.empty?
+      next if host_search && host_search.empty?
       opts[:workspace] = framework.db.workspace
       opts[:hosts] = {address: host_search} if !host_search.nil?
       opts[:port] = ports if ports
@@ -909,7 +901,7 @@ class Db
       vulns = framework.db.vulns({:search_term => search_term})
     else
       each_host_range_chunk(host_ranges) do |host_search|
-        break if !host_search.nil? && host_search.empty?
+        next if host_search && host_search.empty?
 
         vulns.concat(framework.db.vulns({:hosts => { :address => host_search }, :search_term => search_term }))
       end
@@ -1091,7 +1083,7 @@ class Db
     else
       # Collect notes of specified hosts
       each_host_range_chunk(host_ranges) do |host_search|
-        break if !host_search.nil? && host_search.empty?
+        next if host_search && host_search.empty?
 
         opts = {hosts: {address: host_search}, workspace: framework.db.workspace, search_term: search_term}
         opts[:ntype] = types if mode != :update && types && !types.empty?
@@ -1307,7 +1299,7 @@ class Db
       loots = loots + framework.db.loots(workspace: framework.db.workspace, search_term: search_term)
     else
       each_host_range_chunk(host_ranges) do |host_search|
-        break if !host_search.nil? && host_search.empty?
+        next if host_search && host_search.empty?
 
         loots = loots + framework.db.loots(workspace: framework.db.workspace, hosts: { address: host_search }, search_term: search_term)
       end
@@ -1889,24 +1881,8 @@ class Db
     end
   end
 
-  def cmd_db_rebuild_cache
-    unless framework.db.active
-      print_error("The database is not connected")
-      return
-    end
-
-    print_status("Purging and rebuilding the module cache in the background...")
-    framework.threads.spawn("ModuleCacheRebuild", true) do
-      framework.db.purge_all_module_details
-      framework.db.update_all_module_details
-    end
-  end
-
-  def cmd_db_rebuild_cache_help
-    print_line "Usage: db_rebuild_cache"
-    print_line
-    print_line "Purge and rebuild the SQL module cache."
-    print_line
+  def cmd_db_rebuild_cache(*args)
+    print_line "This command is deprecated with Metasploit 5"
   end
 
   def cmd_db_save_help
@@ -2073,7 +2049,11 @@ class Db
   def db_connect_http(opts)
     # local database is required to use Mdm objects
     unless framework.db.active
-      print_error("No local database connected. Please connect to a local database before connecting to a remote data service.")
+      err_msg = 'No local database connected, meaning some Metasploit features will not be available. A full list of '\
+      'the affected features & database setup instructions can be found here: '\
+      'https://github.com/rapid7/metasploit-framework/wiki/msfdb:-Database-Features-&-How-to-Set-up-a-Database-for-Metasploit'
+
+      print_error(err_msg)
       return
     end
 

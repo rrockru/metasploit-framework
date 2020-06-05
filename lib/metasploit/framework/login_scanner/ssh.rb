@@ -39,6 +39,9 @@ module Metasploit
         #
         #   @return [Symbol] An element of {VERBOSITIES}.
         attr_accessor :verbosity
+        # @!attribute skip_gather_proof
+        #   @return [Boolean] Whether to skip calling gather_proof
+        attr_accessor :skip_gather_proof
 
         validates :verbosity,
           presence: true,
@@ -90,7 +93,7 @@ module Metasploit
 
           unless result_options.has_key? :status
             if ssh_socket
-              proof = gather_proof
+              proof = gather_proof unless skip_gather_proof
               result_options.merge!(status: Metasploit::Model::Login::Status::SUCCESSFUL, proof: proof)
             else
               result_options.merge!(status: Metasploit::Model::Login::Status::INCORRECT, proof: nil)
@@ -143,6 +146,20 @@ module Metasploit
                 # Juniper JunOS CLI
                 elsif proof =~ /unknown command: id/
                   proof = ssh_socket.exec!("show version\n").split("\n")[2..4].join(", ").to_s
+                # Brocade CLI
+                elsif proof =~ /Invalid input -> id/ || proof =~ /Protocol error, doesn't start with scp\!/
+                  proof = ssh_socket.exec!("show version\n").to_s
+                  if proof =~ /Version:(?<os_version>.+).+HW: (?<hardware>)/mi
+                    proof = "Model: #{hardware}, OS: #{os_version}"
+                  end
+                # Windows
+                elsif proof =~ /is not recognized as an internal or external command/
+                  proof = ssh_socket.exec!("systeminfo\n").to_s
+                  /OS Name:\s+(?<os_name>.+)$/ =~ proof
+                  /OS Version:\s+(?<os_num>.+)$/ =~ proof
+                  if os_name && os_num
+                    proof = "#{os_name.chomp} #{os_num.chomp}"
+                  end
                 else
                   proof << ssh_socket.exec!("help\n?\n\n\n").to_s
                 end
@@ -177,7 +194,7 @@ module Metasploit
             'hpux'
           when /AIX/
             'aix'
-          when /Win32|Windows/
+          when /Win32|Windows|Microsoft/
             'windows'
           when /Unknown command or computer name|Line has invalid autocommand/
             'cisco-ios'
